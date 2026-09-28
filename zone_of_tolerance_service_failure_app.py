@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import random
 import re
 from io import BytesIO
 from pathlib import Path
@@ -17,7 +18,7 @@ APP_DIR = Path(__file__).resolve().parent
 DEFAULT_USERS_FILE = APP_DIR / "users.xlsx"
 MODEL_NAME = "gemini-3.1-flash-lite"
 CAC_PER_CUSTOMER = 100.0
-SIMULATION_VERSION = 3
+SIMULATION_VERSION = 4
 YEARS = range(1, 6)
 
 
@@ -28,6 +29,12 @@ class RetentionResponse(BaseModel):
     year_4_probability: int = Field(ge=0, le=100)
     year_5_probability: int = Field(ge=0, le=100)
     reason: str = Field(description="One concise sentence explaining the decisions")
+
+
+class DissatisfactionResponse(BaseModel):
+    reason: str = Field(
+        description="One concise, realistic first-person reason why this customer became dissatisfied"
+    )
 
 
 def clean_value(value: object) -> str | None:
@@ -167,11 +174,11 @@ async def query_profile(profile_id: int, firm: str, prompt: str, llm, semaphore:
     return {"Profile ID": profile_id, "Status": "Unknown error"}
 
 
-async def run_all(tasks: list, progress) -> list[dict]:
+async def run_all(tasks: list, progress, item_label: str = "profiles simulated") -> list[dict]:
     results = []
     for completed, task in enumerate(asyncio.as_completed(tasks), start=1):
         results.append(await task)
-        progress.progress(completed / len(tasks), text=f"{completed} of {len(tasks)} profiles simulated")
+        progress.progress(completed / len(tasks), text=f"{completed} of {len(tasks)} {item_label}")
     return results
 
 
@@ -210,55 +217,86 @@ def calculate_clv(results: pd.DataFrame, monthly_sales: float, margin_percent: f
     ])
 
 
-def allocate_counts(total: int, shares: dict[int, float]) -> dict[int, int]:
-    """Allocate an integer customer count using the largest-remainder method."""
-    raw = {year: total * shares[year] / 100 for year in YEARS}
-    counts = {year: int(raw[year]) for year in YEARS}
-    remaining = total - sum(counts.values())
-    order = sorted(YEARS, key=lambda year: (raw[year] - counts[year], -year), reverse=True)
-    for year in order[:remaining]:
-        counts[year] += 1
-    return counts
+def failure_prompt(firm: str, description: str, year: int, row: pd.Series) -> str:
+    excluded = {"Profile ID", "Status", "Reason"}
+    profile = {
+        str(column): clean_value(value)
+        for column, value in row.items()
+        if column not in excluded and not str(column).startswith("Year ") and clean_value(value) is not None
+    }
+    profile_text = "\n".join(f"- {key}: {value}" for key, value in profile.items()) or "- No additional profile fields"
+    return f"""Act as this customer's digital twin in a fictional service-failure exercise.
+
+Firm: {firm}
+Firm/service description: {description}
+The service failure occurs in Year {year}.
+Customer profile:
+{profile_text}
+Baseline retention rationale: {row.get('Reason', '')}
+
+Generate one plausible and specific reason this customer became angry or dissatisfied with the
+service in that year. Make it relevant to the offering and, where useful, the profile. Use a
+short first-person sentence. Do not mention that this is a simulation, do not blame the customer,
+and do not invent severe injury, crime, discrimination, or other extreme events."""
 
 
-def apply_service_failure(
-    baseline: pd.DataFrame, angry_percent: float, shares: dict[int, float], reasons: dict[int, str], firm: str
+async def query_failure_reason(profile_id: int, year: int, prompt: str, llm, semaphore: asyncio.Semaphore) -> dict:
+    async with semaphore:
+        for attempt in range(5):
+            try:
+                response = await llm.ainvoke(prompt)
+                return {"Profile ID": profile_id, "Failure year": f"Year {year}", "Dissatisfaction reason": response.reason}
+            except Exception as exc:
+                if attempt < 4:
+                    await asyncio.sleep(2**attempt)
+                else:
+                    return {
+                        "Profile ID": profile_id,
+                        "Failure year": f"Year {year}",
+                        "Dissatisfaction reason": f"AI reason unavailable: {exc}",
+                    }
+    return {}
+
+
+def simulate_service_failures(
+    baseline: pd.DataFrame, angry_percent: float, firm: str, description: str, api_key: str
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Force a reproducible set of otherwise-active customers to leave in assigned years."""
+    """Randomly select angry customers and failure years, then generate their reasons with AI."""
     scenario = baseline.copy()
-    successful_ids = scenario.loc[scenario["Status"] == "Success", "Profile ID"].tolist()
-    requested = min(
-        len(successful_ids),
-        max(1, round(len(successful_ids) * angry_percent / 100)) if angry_percent > 0 else 0,
-    )
-    planned = allocate_counts(requested, shares)
-    available = set(successful_ids)
+    successful = scenario.loc[scenario["Status"] == "Success"].copy()
+    requested = min(len(successful), max(1, round(len(successful) * angry_percent / 100)))
+    chosen_ids = random.sample(successful["Profile ID"].tolist(), requested)
+
     assignments = []
+    llm = ChatGoogleGenerativeAI(
+        model=MODEL_NAME, temperature=0.8, google_api_key=api_key
+    ).with_structured_output(DissatisfactionResponse)
+    semaphore = asyncio.Semaphore(40)
+    tasks = []
+    for profile_id in chosen_ids:
+        row = successful.loc[successful["Profile ID"] == profile_id].iloc[0]
+        # Assign every selected angry customer directly across all five years.
+        year = random.randint(1, 5)
+        assignments.append((profile_id, year))
+        tasks.append(query_failure_reason(
+            profile_id, year, failure_prompt(firm, description, year, row), llm, semaphore
+        ))
 
-    for year in YEARS:
-        if year == 1:
-            eligible = list(available)
-        else:
-            eligible = [
-                profile_id for profile_id in available
-                if bool(scenario.loc[scenario["Profile ID"] == profile_id, f"Year {year - 1} return"].iloc[0])
-            ]
-        eligible.sort(key=lambda profile_id: stable_number(firm, "service failure", year, profile_id))
-        chosen = eligible[:planned[year]]
-        for profile_id in chosen:
-            available.remove(profile_id)
-            row_mask = scenario["Profile ID"] == profile_id
-            for later_year in range(year, 6):
-                scenario.loc[row_mask, f"Year {later_year} return"] = False
-            scenario.loc[row_mask, "Service failure year"] = f"Year {year}"
-            scenario.loc[row_mask, "Dissatisfaction reason"] = reasons[year]
-            assignments.append({
-                "Profile ID": profile_id,
-                "Failure year": f"Year {year}",
-                "Dissatisfaction reason": reasons[year],
-            })
+    progress = st.progress(0, text="Generating angry-customer reasons...")
+    generated = asyncio.run(run_all(tasks, progress, "AI dissatisfaction reasons generated"))
+    progress.empty()
+    assignment_frame = pd.DataFrame(generated)
 
-    return scenario, pd.DataFrame(assignments)
+    for profile_id, year in assignments:
+        row_mask = scenario["Profile ID"] == profile_id
+        reason_match = assignment_frame.loc[assignment_frame["Profile ID"] == profile_id, "Dissatisfaction reason"]
+        reason = reason_match.iloc[0] if not reason_match.empty else "AI reason unavailable"
+        for later_year in range(year, 6):
+            scenario.loc[row_mask, f"Year {later_year} return"] = False
+        scenario.loc[row_mask, "Service failure year"] = f"Year {year}"
+        scenario.loc[row_mask, "Dissatisfaction reason"] = reason
+
+    return scenario, assignment_frame
 
 
 def recovery_suggestion(reason: str) -> str:
@@ -344,8 +382,9 @@ if st.button("Run baseline: no service failure", type="primary", use_container_w
             responses = simulate_retention(selected_profiles, firm_name, firm_description, persona, api_key)
         st.session_state["clv_run_service_failure"] = {
             "responses": responses, "firm": firm_name, "monthly_sales": monthly_sales,
-            "margin": margin_percent, "version": SIMULATION_VERSION,
+            "margin": margin_percent, "description": firm_description, "version": SIMULATION_VERSION,
         }
+        st.session_state.pop("service_failure_result", None)
 
 state_key = "clv_run_service_failure"
 if state_key in st.session_state and st.session_state[state_key].get("version") != SIMULATION_VERSION:
@@ -375,47 +414,28 @@ if state_key in st.session_state:
     b4.metric("Baseline CLV : CAC", f"{baseline_ratio:.2f} : 1")
 
     st.subheader("2. Optional service-failure scenario")
-    st.caption("Leave the angry proportion at 0% if you only want the baseline. This scenario does not call the model again.")
+    st.caption(
+        "Enter only the angry-customer proportion. The app randomly selects that proportion of customers, "
+        "randomly assigns them across Years 1–5, "
+        "then each AI customer explains why they became dissatisfied."
+    )
     angry_percent = st.slider(
         "What proportion of customers should become angry?", 0, 100, 0, 1,
         help="Selected customers stop returning in their assigned failure year and all later years.",
     )
 
     if angry_percent > 0:
-        st.markdown("Distribute the angry customers across the five failure years. The percentages must total 100%.")
-        default_shares = [20, 20, 20, 20, 20]
-        share_cols = st.columns(5)
-        shares = {
-            year: float(share_cols[year - 1].number_input(
-                f"Year {year} share (%)", min_value=0, max_value=100,
-                value=default_shares[year - 1], step=1, key=f"failure_share_{year}",
-            )) for year in YEARS
-        }
-        st.write(f"Current distribution total: **{sum(shares.values()):.0f}%**")
-        st.markdown("For every year with an allocation, enter why those customers became dissatisfied.")
-        reasons = {}
-        for year in YEARS:
-            if shares[year] > 0:
-                reasons[year] = st.text_input(
-                    f"Year {year} dissatisfaction reason",
-                    placeholder="e.g., long delays and poor communication",
-                    key=f"failure_reason_{year}",
+        expected_angry = max(1, round(acquired * angry_percent / 100))
+        st.info(f"The scenario will create {expected_angry:,} angry AI customer(s) from {acquired:,} successful profiles.")
+        if st.button("Run service-failure simulation", type="primary", use_container_width=True):
+            with st.spinner("Randomly assigning angry customers across five years and generating their reasons..."):
+                scenario, assignments = simulate_service_failures(
+                    results, angry_percent, run["firm"], run["description"], api_key
                 )
-            else:
-                reasons[year] = ""
-
-        if st.button("Apply service failure and compare", type="primary", use_container_width=True):
-            missing_reasons = [f"Year {year}" for year in YEARS if shares[year] > 0 and not reasons[year].strip()]
-            if abs(sum(shares.values()) - 100) > 0.001:
-                st.error("The five yearly shares must add to 100%.")
-            elif missing_reasons:
-                st.error("Add a dissatisfaction reason for: " + ", ".join(missing_reasons) + ".")
-            else:
-                scenario, assignments = apply_service_failure(results, angry_percent, shares, reasons, run["firm"])
-                st.session_state["service_failure_result"] = {
-                    "scenario": scenario, "assignments": assignments, "angry_percent": angry_percent,
-                    "shares": shares, "reasons": reasons, "baseline_fingerprint": id(results),
-                }
+            st.session_state["service_failure_result"] = {
+                "scenario": scenario, "assignments": assignments, "angry_percent": angry_percent,
+                "baseline_fingerprint": id(results),
+            }
 
     scenario_run = st.session_state.get("service_failure_result")
     if scenario_run and scenario_run.get("baseline_fingerprint") == id(results):
@@ -434,9 +454,12 @@ if state_key in st.session_state:
         c2.metric("Lost 5-year CLV", f"${baseline_total - failure_total:,.2f}")
         c3.metric("Angry customers assigned", f"{len(assignments):,}")
         c4.metric("Requested angry share", f"{scenario_run['angry_percent']:.0f}%")
-        requested_angry = max(1, round(acquired * scenario_run["angry_percent"] / 100))
-        if len(assignments) < requested_angry:
-            st.warning("Some late-year assignments were not possible because too few customers were still active before that year.")
+        year_counts = assignments["Failure year"].value_counts().reindex(
+            [f"Year {year}" for year in YEARS], fill_value=0
+        )
+        st.caption("Random failure-year distribution: " + ", ".join(
+            f"{year}: {count}" for year, count in year_counts.items()
+        ))
 
         figure = comparison_figure(baseline_summary, failure_summary, run["firm"])
         st.pyplot(figure, use_container_width=True)
@@ -455,17 +478,8 @@ if state_key in st.session_state:
         st.dataframe(comparison, use_container_width=True, hide_index=True)
 
         st.subheader("Feedback: how to improve")
-        feedback_rows = []
-        for year in YEARS:
-            year_assignments = int((assignments["Failure year"] == f"Year {year}").sum()) if not assignments.empty else 0
-            if scenario_run["shares"][year] > 0:
-                feedback_rows.append({
-                    "Failure year": f"Year {year}",
-                    "Affected customers": year_assignments,
-                    "Dissatisfaction reason": scenario_run["reasons"][year],
-                    "Recommended response": recovery_suggestion(scenario_run["reasons"][year]),
-                })
-        feedback = pd.DataFrame(feedback_rows)
+        feedback = assignments.copy()
+        feedback["Recommended response"] = feedback["Dissatisfaction reason"].map(recovery_suggestion)
         st.dataframe(feedback, use_container_width=True, hide_index=True)
         st.success(
             "Priority: start with the year/reason producing the greatest downstream CLV loss, fix the root cause, "
