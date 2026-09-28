@@ -20,6 +20,26 @@ MODEL_NAME = "gemini-3.1-flash-lite"
 CAC_PER_CUSTOMER = 100.0
 SIMULATION_VERSION = 4
 YEARS = range(1, 6)
+RECOVERY_STRATEGIES = {
+    "Fast response and sincere apology": (
+        "Respond immediately, acknowledge the failure, and give a sincere apology that shows courtesy and respect."
+    ),
+    "Explanation and accountability": (
+        "Clearly explain what happened, accept responsibility, and tell the customer what will be done next."
+    ),
+    "Empathetic and fair personal treatment": (
+        "Listen carefully and treat the customer politely, honestly, consistently, and with dignity."
+    ),
+    "Meaningful non-monetary remedy": (
+        "Offer a quick, useful non-cash remedy such as priority service, a redo, replacement, or added convenience."
+    ),
+    "Fair compensation for the inconvenience": (
+        "Provide a proportionate refund, credit, or compensation that recognizes the customer's time and inconvenience."
+    ),
+    "Simple meaningful service guarantee": (
+        "Invoke an easy-to-understand guarantee with few restrictions and provide the promised reparation immediately."
+    ),
+}
 
 
 class RetentionResponse(BaseModel):
@@ -34,6 +54,23 @@ class RetentionResponse(BaseModel):
 class DissatisfactionResponse(BaseModel):
     reason: str = Field(
         description="One concise, realistic first-person reason why this customer became dissatisfied"
+    )
+
+
+class RecoveryResponse(BaseModel):
+    persuaded_to_continue: bool = Field(
+        description="Whether this customer is persuaded to continue with the firm after the recovery"
+    )
+    response: str = Field(
+        description="One concise first-person explanation of why the recovery did or did not persuade the customer"
+    )
+
+
+class RecoveryMessageOptions(BaseModel):
+    messages: list[str] = Field(
+        min_length=5,
+        max_length=5,
+        description="Exactly five distinct customer-facing recovery messages",
     )
 
 
@@ -299,6 +336,206 @@ def simulate_service_failures(
     return scenario, assignment_frame
 
 
+def recovery_prompt(
+    firm: str, description: str, strategy_name: str, strategy_action: str,
+    assignment: pd.Series, profile: pd.Series,
+) -> str:
+    excluded = {"Profile ID", "Status", "Reason"}
+    profile_fields = {
+        str(column): clean_value(value)
+        for column, value in profile.items()
+        if column not in excluded and not str(column).startswith("Year ") and clean_value(value) is not None
+    }
+    profile_text = "\n".join(f"- {key}: {value}" for key, value in profile_fields.items()) or "- No additional profile fields"
+    return f"""Act as the same customer digital twin who experienced a service failure.
+
+Firm: {firm}
+Firm/service description: {description}
+Customer profile ID: {int(assignment['Profile ID'])}
+Customer profile:
+{profile_text}
+Failure year: {assignment['Failure year']}
+The customer's dissatisfaction comment: {assignment['Dissatisfaction reason']}
+
+The firm now uses this recovery strategy:
+{strategy_name}: {strategy_action}
+
+Decide whether this specific recovery would persuade this customer to continue with the firm.
+Consider the fit between the complaint, the recovery offered, the service, and the customer profile.
+Do not assume every recovery succeeds. A mismatched, vague, or insufficient recovery should fail.
+Return a yes/no decision and one short first-person explanation."""
+
+
+async def query_recovery(
+    profile_id: int, failure_year: str, dissatisfaction: str, prompt: str, llm, semaphore: asyncio.Semaphore
+) -> dict:
+    async with semaphore:
+        for attempt in range(5):
+            try:
+                response = await llm.ainvoke(prompt)
+                return {
+                    "Profile ID": profile_id,
+                    "Failure year": failure_year,
+                    "Dissatisfaction reason": dissatisfaction,
+                    "Persuaded to continue": bool(response.persuaded_to_continue),
+                    "Customer response": response.response,
+                }
+            except Exception as exc:
+                if attempt < 4:
+                    await asyncio.sleep(2**attempt)
+                else:
+                    return {
+                        "Profile ID": profile_id,
+                        "Failure year": failure_year,
+                        "Dissatisfaction reason": dissatisfaction,
+                        "Persuaded to continue": False,
+                        "Customer response": f"AI recovery response unavailable: {exc}",
+                    }
+    return {}
+
+
+def simulate_recovery(
+    baseline: pd.DataFrame, failure_scenario: pd.DataFrame, assignments: pd.DataFrame,
+    firm: str, description: str, strategy_name: str, api_key: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return the strategy to each affected profile and restore baseline behavior if persuaded."""
+    recovered = failure_scenario.copy()
+    strategy_action = RECOVERY_STRATEGIES[strategy_name]
+    llm = ChatGoogleGenerativeAI(
+        model=MODEL_NAME, temperature=0.4, google_api_key=api_key
+    ).with_structured_output(RecoveryResponse)
+    semaphore = asyncio.Semaphore(40)
+    tasks = []
+    for _, assignment in assignments.iterrows():
+        profile_id = int(assignment["Profile ID"])
+        profile = baseline.loc[baseline["Profile ID"] == profile_id].iloc[0]
+        tasks.append(query_recovery(
+            profile_id,
+            str(assignment["Failure year"]),
+            str(assignment["Dissatisfaction reason"]),
+            recovery_prompt(firm, description, strategy_name, strategy_action, assignment, profile),
+            llm,
+            semaphore,
+        ))
+
+    progress = st.progress(0, text="Angry customers are evaluating the recovery...")
+    responses = pd.DataFrame(asyncio.run(run_all(tasks, progress, "customer recovery decisions generated")))
+    progress.empty()
+
+    for _, decision in responses.iterrows():
+        profile_id = int(decision["Profile ID"])
+        row_mask = recovered["Profile ID"] == profile_id
+        recovered.loc[row_mask, "Recovery strategy"] = strategy_name
+        recovered.loc[row_mask, "Persuaded to continue"] = bool(decision["Persuaded to continue"])
+        recovered.loc[row_mask, "Customer recovery response"] = decision["Customer response"]
+        if bool(decision["Persuaded to continue"]):
+            failure_year = int(str(decision["Failure year"]).split()[-1])
+            baseline_row = baseline.loc[baseline["Profile ID"] == profile_id].iloc[0]
+            for year in range(failure_year, 6):
+                recovered.loc[row_mask, f"Year {year} return"] = bool(baseline_row[f"Year {year} return"])
+
+    return recovered, responses
+
+
+def generate_recovery_messages(
+    firm: str, description: str, strategy_name: str, assignment: pd.Series,
+    profile: pd.Series, api_key: str,
+) -> list[str]:
+    strategy_action = RECOVERY_STRATEGIES[strategy_name]
+    excluded = {"Profile ID", "Status", "Reason"}
+    profile_fields = {
+        str(column): clean_value(value)
+        for column, value in profile.items()
+        if column not in excluded and not str(column).startswith("Year ") and clean_value(value) is not None
+    }
+    profile_text = "\n".join(f"- {key}: {value}" for key, value in profile_fields.items()) or "- No additional profile fields"
+    prompt = f"""You are helping a student write a service-recovery response to one dissatisfied customer.
+
+Company: {firm}
+Company/service description: {description}
+Customer profile ID: {int(assignment['Profile ID'])}
+Customer profile:
+{profile_text}
+Failure year: {assignment['Failure year']}
+Customer's exact dissatisfaction comment: {assignment['Dissatisfaction reason']}
+Selected recovery strategy: {strategy_name}
+Meaning of the strategy: {strategy_action}
+
+Write exactly five distinct response options that the company's employee could send directly to
+this customer. Each option must be 1-3 sentences, natural, specific to the company/service and
+the complaint, and clearly demonstrate the selected strategy. Vary tone or execution so the
+student has a meaningful choice. Do not claim that an action has already occurred. Do not invent
+contact details, policy terms, dollar amounts, discounts, or benefits not supplied above."""
+    llm = ChatGoogleGenerativeAI(
+        model=MODEL_NAME, temperature=0.8, google_api_key=api_key
+    ).with_structured_output(RecoveryMessageOptions)
+    for attempt in range(5):
+        try:
+            response = llm.invoke(prompt)
+            return [message.strip() for message in response.messages]
+        except Exception:
+            if attempt == 4:
+                raise
+    return []
+
+
+def evaluate_recovery_message(
+    firm: str, description: str, strategy_name: str, selected_message: str,
+    assignment: pd.Series, profile: pd.Series, api_key: str,
+) -> RecoveryResponse:
+    excluded = {"Profile ID", "Status", "Reason"}
+    profile_fields = {
+        str(column): clean_value(value)
+        for column, value in profile.items()
+        if column not in excluded and not str(column).startswith("Year ") and clean_value(value) is not None
+    }
+    profile_text = "\n".join(f"- {key}: {value}" for key, value in profile_fields.items()) or "- No additional profile fields"
+    prompt = f"""Act as the same customer digital twin who experienced this service failure.
+
+Company: {firm}
+Company/service description: {description}
+Customer profile ID: {int(assignment['Profile ID'])}
+Customer profile:
+{profile_text}
+Failure year: {assignment['Failure year']}
+Your dissatisfaction comment: {assignment['Dissatisfaction reason']}
+Recovery strategy category: {strategy_name}
+
+The company sends you this exact response:
+\"{selected_message}\"
+
+Decide whether this exact response persuades you to continue with the company. Judge how well it
+addresses your complaint, its specificity, fairness, empathy, and credibility. Do not assume that
+every polished response succeeds. Return a yes/no decision and one concise first-person reason."""
+    llm = ChatGoogleGenerativeAI(
+        model=MODEL_NAME, temperature=0.4, google_api_key=api_key
+    ).with_structured_output(RecoveryResponse)
+    for attempt in range(5):
+        try:
+            return llm.invoke(prompt)
+        except Exception:
+            if attempt == 4:
+                raise
+    raise RuntimeError("Recovery decision could not be generated.")
+
+
+def apply_recovery_interactions(
+    baseline: pd.DataFrame, failure_scenario: pd.DataFrame, interactions: dict[int, dict]
+) -> pd.DataFrame:
+    recovered = failure_scenario.copy()
+    for profile_id, interaction in interactions.items():
+        row_mask = recovered["Profile ID"] == profile_id
+        recovered.loc[row_mask, "Recovery strategy"] = interaction["strategy"]
+        recovered.loc[row_mask, "Recovery message"] = interaction["message"]
+        recovered.loc[row_mask, "Persuaded to continue"] = interaction["persuaded"]
+        recovered.loc[row_mask, "Customer recovery response"] = interaction["customer_response"]
+        if interaction["persuaded"]:
+            baseline_row = baseline.loc[baseline["Profile ID"] == profile_id].iloc[0]
+            for year in range(interaction["failure_year"], 6):
+                recovered.loc[row_mask, f"Year {year} return"] = bool(baseline_row[f"Year {year} return"])
+    return recovered
+
+
 def recovery_suggestion(reason: str) -> str:
     text = reason.casefold()
     if any(word in text for word in ("wait", "slow", "delay", "late")):
@@ -322,6 +559,22 @@ def comparison_figure(baseline: pd.DataFrame, failure: pd.DataFrame, firm: str):
     axis.bar([value + width / 2 for value in x], failure["Annual CLV contribution"], width, label="With service failure", color="#dc2626")
     axis.set_xticks(x, baseline["Year"])
     axis.set_title(f"CLV impact of service failure — {firm}", pad=14)
+    axis.set_ylabel("CLV contribution ($)")
+    axis.grid(axis="y", alpha=0.2)
+    axis.legend()
+    figure.tight_layout()
+    return figure
+
+
+def recovery_figure(baseline: pd.DataFrame, failure: pd.DataFrame, recovered: pd.DataFrame, firm: str):
+    figure, axis = plt.subplots(figsize=(10, 5.4))
+    x = list(range(5))
+    width = 0.25
+    axis.bar([value - width for value in x], baseline["Annual CLV contribution"], width, label="Baseline", color="#2563eb")
+    axis.bar(x, failure["Annual CLV contribution"], width, label="After failure", color="#dc2626")
+    axis.bar([value + width for value in x], recovered["Annual CLV contribution"], width, label="After recovery", color="#16a34a")
+    axis.set_xticks(x, baseline["Year"])
+    axis.set_title(f"CLV before failure and after recovery — {firm}", pad=14)
     axis.set_ylabel("CLV contribution ($)")
     axis.grid(axis="y", alpha=0.2)
     axis.legend()
@@ -436,6 +689,9 @@ if state_key in st.session_state:
                 "scenario": scenario, "assignments": assignments, "angry_percent": angry_percent,
                 "baseline_fingerprint": id(results),
             }
+            st.session_state.pop("recovery_result", None)
+            st.session_state.pop("recovery_message_options", None)
+            st.session_state.pop("recovery_interactions", None)
 
     scenario_run = st.session_state.get("service_failure_result")
     if scenario_run and scenario_run.get("baseline_fingerprint") == id(results):
@@ -485,6 +741,135 @@ if state_key in st.session_state:
             "Priority: start with the year/reason producing the greatest downstream CLV loss, fix the root cause, "
             "and rerun the scenario with a lower angry-customer proportion to quantify the value of improvement."
         )
+
+        st.divider()
+        st.subheader("3. Interact with one angry customer")
+        assignment_lookup = assignments.set_index("Profile ID")
+        profile_ids = [int(value) for value in assignments["Profile ID"].tolist()]
+        selected_profile_id = st.selectbox(
+            "Choose the profile ID whose problem you want to solve",
+            options=profile_ids,
+            format_func=lambda profile_id: (
+                f"Profile {profile_id} — {assignment_lookup.loc[profile_id, 'Failure year']}: "
+                f"{str(assignment_lookup.loc[profile_id, 'Dissatisfaction reason'])[:90]}"
+            ),
+        )
+        selected_assignment = assignments.loc[assignments["Profile ID"] == selected_profile_id].iloc[0]
+        st.warning(f"Customer complaint: {selected_assignment['Dissatisfaction reason']}")
+        strategy_name = st.selectbox(
+            "Customer recovery strategy",
+            options=list(RECOVERY_STRATEGIES),
+            help="These quick customer-facing strategies are drawn from the Chapter 7 service-recovery slides.",
+        )
+        st.info(RECOVERY_STRATEGIES[strategy_name])
+        if st.button("Generate five response options", type="primary", use_container_width=True):
+            selected_profile = results.loc[results["Profile ID"] == selected_profile_id].iloc[0]
+            try:
+                with st.spinner("AI is drafting five company- and complaint-specific responses..."):
+                    messages = generate_recovery_messages(
+                        run["firm"], run["description"], strategy_name,
+                        selected_assignment, selected_profile, api_key,
+                    )
+                st.session_state["recovery_message_options"] = {
+                    "failure_fingerprint": id(scenario),
+                    "profile_id": selected_profile_id,
+                    "strategy": strategy_name,
+                    "messages": messages,
+                }
+            except Exception as exc:
+                st.error(f"Could not generate recovery messages: {exc}")
+
+        message_run = st.session_state.get("recovery_message_options")
+        message_matches = (
+            message_run
+            and message_run.get("failure_fingerprint") == id(scenario)
+            and message_run.get("profile_id") == selected_profile_id
+            and message_run.get("strategy") == strategy_name
+        )
+        if message_matches:
+            st.markdown("#### Choose the response you want to send")
+            selected_message = st.radio(
+                "Five AI-generated response options",
+                options=message_run["messages"],
+                format_func=lambda message: message,
+                key=f"recovery_message_{selected_profile_id}_{safe_filename(strategy_name)}",
+            )
+            if st.button("Send selected response to this customer", type="primary", use_container_width=True):
+                selected_profile = results.loc[results["Profile ID"] == selected_profile_id].iloc[0]
+                try:
+                    with st.spinner("The AI customer is deciding whether to stay with the company..."):
+                        decision = evaluate_recovery_message(
+                            run["firm"], run["description"], strategy_name, selected_message,
+                            selected_assignment, selected_profile, api_key,
+                        )
+                    interactions = dict(st.session_state.get("recovery_interactions", {}))
+                    interactions[selected_profile_id] = {
+                        "profile_id": selected_profile_id,
+                        "failure_year": int(str(selected_assignment["Failure year"]).split()[-1]),
+                        "dissatisfaction": str(selected_assignment["Dissatisfaction reason"]),
+                        "strategy": strategy_name,
+                        "message": selected_message,
+                        "persuaded": bool(decision.persuaded_to_continue),
+                        "customer_response": decision.response,
+                        "failure_fingerprint": id(scenario),
+                    }
+                    st.session_state["recovery_interactions"] = interactions
+                except Exception as exc:
+                    st.error(f"Could not generate the customer's decision: {exc}")
+
+        all_interactions = st.session_state.get("recovery_interactions", {})
+        interactions = {
+            int(profile_id): interaction for profile_id, interaction in all_interactions.items()
+            if interaction.get("failure_fingerprint") == id(scenario)
+        }
+        if interactions:
+            recovered_scenario = apply_recovery_interactions(results, scenario, interactions)
+            recovery_responses = pd.DataFrame(list(interactions.values())).rename(columns={
+                "profile_id": "Profile ID",
+                "failure_year": "Failure year",
+                "dissatisfaction": "Dissatisfaction reason",
+                "strategy": "Recovery strategy",
+                "message": "Selected response",
+                "persuaded": "Persuaded to continue",
+                "customer_response": "Customer response",
+            }).drop(columns=["failure_fingerprint"])
+            recovery_responses["Failure year"] = recovery_responses["Failure year"].map(lambda year: f"Year {year}")
+            recovered_summary = calculate_clv(recovered_scenario, run["monthly_sales"], run["margin"])
+            recovered_total = float(recovered_summary["Annual CLV contribution"].sum())
+            recovered_average = recovered_total / acquired
+            recovered_ratio = recovered_average / CAC_PER_CUSTOMER
+            persuaded = int(recovery_responses["Persuaded to continue"].sum())
+            recovered_clv = recovered_total - failure_total
+
+            st.subheader("Recovery simulation results")
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("Recovered CLV:CAC", f"{recovered_ratio:.2f} : 1", delta=f"+{recovered_ratio - failure_ratio:.2f}")
+            r2.metric("CLV recovered", f"${recovered_clv:,.2f}")
+            r3.metric("Customers persuaded", f"{persuaded} of {len(recovery_responses)}")
+            r4.metric("Recovery success rate", f"{persuaded / len(recovery_responses):.1%}")
+            st.caption("Results update cumulatively as students interact with additional angry profiles.")
+
+            recovery_chart = recovery_figure(baseline_summary, failure_summary, recovered_summary, run["firm"])
+            st.pyplot(recovery_chart, use_container_width=True)
+            recovery_image = BytesIO()
+            recovery_chart.savefig(recovery_image, format="png", dpi=200, bbox_inches="tight")
+            plt.close(recovery_chart)
+
+            st.markdown("#### What each angry customer decided")
+            st.dataframe(recovery_responses, use_container_width=True, hide_index=True)
+            rr1, rr2 = st.columns(2)
+            rr1.download_button(
+                "Download recovery decisions",
+                recovery_responses.to_csv(index=False).encode("utf-8-sig"),
+                f"{safe_filename(run['firm'])}_recovery_decisions.csv",
+                "text/csv",
+            )
+            rr2.download_button(
+                "Download recovery chart",
+                recovery_image.getvalue(),
+                f"{safe_filename(run['firm'])}_recovery_impact.png",
+                "image/png",
+            )
 
         stem = safe_filename(run["firm"])
         d1, d2, d3, d4 = st.columns(4)
